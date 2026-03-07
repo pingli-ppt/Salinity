@@ -1,0 +1,12 @@
+dataset/
+result/
+.idea/
+.vscode/
+.git
+*.DS_Store
+venv/
+*.csv
+*.xlsx
+*.xls
+figures/*.csv
+figures/*.data
