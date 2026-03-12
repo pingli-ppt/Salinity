@@ -4,13 +4,126 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 import torch
+from einops import rearrange
 from torch.utils.data import DataLoader
 
-from ts_benchmark.baselines.duet.utils.timefeatures import (
+from ..utils.timefeatures import (
     time_features,
 )
-from ts_benchmark.utils.data_processing import split_before
 from torch import nn
+from ts_benchmark.utils.data_processing import split_time
+from ..layers.SelfAttention_Family import FullAttention, AttentionLayer
+
+
+def adjust_learning_rate(optimizer, epoch, args):
+    # lr = args.learning_rate * (0.2 ** (epoch // 2))
+    if args.lradj == "type1":
+        lr_adjust = {epoch: args.lr * (0.5 ** ((epoch - 1) // 1))}
+    elif args.lradj == "type2":
+        lr_adjust = {2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6, 10: 5e-7, 15: 1e-7, 20: 5e-8}
+    elif args.lradj == "type3":
+        lr_adjust = {
+            epoch: args.lr if epoch < 3 else args.lr * (0.9 ** ((epoch - 3) // 1))
+        }
+    elif args.lradj == "constant":
+        lr_adjust = {epoch: args.lr}
+    if epoch in lr_adjust.keys():
+        lr = lr_adjust[epoch]
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+        print("Updating learning rate to {}".format(lr))
+
+
+class EarlyStopping:
+    def __init__(self, patience=7, delta=0):
+        self.patience = patience
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        improved = False
+        if self.best_score is None:
+            self.best_score = score
+            improved = True
+            print(
+                f"Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ..."
+            )
+            self.val_loss_min = val_loss
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            improved = True
+            print(
+                f"Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ..."
+            )
+            self.val_loss_min = val_loss
+            self.counter = 0
+        return improved
+
+
+class EMA(nn.Module):
+    """
+    Exponential Moving Average (EMA) block to highlight the trend of time series
+    """
+
+    def __init__(self, alpha):
+        super(EMA, self).__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        _, t, _ = x.shape
+        powers = torch.flip(torch.arange(t, dtype=torch.double), dims=(0,))
+        weights = torch.pow((1 - self.alpha), powers).to("cuda")
+        divisor = weights.clone()
+        weights[1:] = weights[1:] * self.alpha
+        weights = weights.reshape(1, t, 1)
+        divisor = divisor.reshape(1, t, 1)
+        x = torch.cumsum(x * weights, dim=1)
+        x = torch.div(x, divisor)
+        return x.to(torch.float32)
+
+
+class DECOMP(nn.Module):
+    """
+    Series decomposition block
+    """
+
+    def __init__(self, alpha):
+        super(DECOMP, self).__init__()
+        self.ma = EMA(alpha)
+
+    def forward(self, x):
+        moving_average = self.ma(x)
+        res = x - moving_average
+        return res, moving_average
+
+
+class DBLoss(nn.Module):
+    """自定义分解损失函数（趋势+季节双损失）"""
+
+    def __init__(self, alpha, beta):
+        super().__init__()
+        self.decomp = DECOMP(alpha)
+        self.beta = beta
+        self.mse = nn.MSELoss(reduction="mean")
+        self.mae = nn.L1Loss(reduction="mean")
+
+    def forward(self, pred, target):
+        pred_season, pred_trend = self.decomp(pred)
+        target_season, target_trend = self.decomp(target)
+
+        season_loss = self.mse(pred_season, target_season)
+        trend_loss = self.mae(pred_trend, target_trend)
+        return self.beta * season_loss + (1 - self.beta) * trend_loss
+
 
 class SlidingWindowDataLoader:
     """
@@ -20,12 +133,12 @@ class SlidingWindowDataLoader:
     """
 
     def __init__(
-        self,
-        dataset: pd.DataFrame,
-        batch_size: int = 1,
-        history_length: int = 10,
-        prediction_length: int = 2,
-        shuffle: bool = True,
+            self,
+            dataset: pd.DataFrame,
+            batch_size: int = 1,
+            history_length: int = 10,
+            prediction_length: int = 2,
+            shuffle: bool = True,
     ):
         """
         Initialize SlidingWindDataLoader.
@@ -75,18 +188,18 @@ class SlidingWindowDataLoader:
         batch_targets = []
         for _ in range(self.batch_size):
             window_data = self.dataset.iloc[
-                self.current_index : self.current_index
-                + self.history_length
-                + self.prediction_length,
-                :,
-            ]
+                          self.current_index: self.current_index
+                                              + self.history_length
+                                              + self.prediction_length,
+                          :,
+                          ]
             if len(window_data) < self.history_length + self.prediction_length:
                 raise StopIteration  # Stop iteration when the dataset is less than one window size and prediction step size
 
             inputs = window_data.iloc[: self.history_length].values
             targets = window_data.iloc[
-                self.history_length : self.history_length + self.prediction_length
-            ].values
+                      self.history_length: self.history_length + self.prediction_length
+                      ].values
 
             batch_inputs.append(inputs)
             batch_targets.append(targets)
@@ -112,19 +225,19 @@ def train_val_split(train_data, ratio, seq_len):
     elif seq_len is not None:
         border = int((train_data.shape[0]) * ratio)
 
-        train_data_value, valid_data_rest = split_before(train_data, border)
-        train_data_rest, valid_data = split_before(train_data, border - seq_len)
+        train_data_value, valid_data_rest = split_time(train_data, border)
+        train_data_rest, valid_data = split_time(train_data, border - seq_len)
         return train_data_value, valid_data
     else:
         border = int((train_data.shape[0]) * ratio)
 
-        train_data_value, valid_data_rest = split_before(train_data, border)
+        train_data_value, valid_data_rest = split_time(train_data, border)
         return train_data_value, valid_data_rest
 
 
 def decompose_time(
-    time: np.ndarray,
-    freq: str,
+        time: np.ndarray,
+        freq: str,
 ) -> np.ndarray:
     """
     Split the given array of timestamps into components based on the frequency.
@@ -159,9 +272,9 @@ def decompose_time(
 
 
 def get_time_mark(
-    time_stamp: np.ndarray,
-    timeenc: int,
-    freq: str,
+        time_stamp: np.ndarray,
+        timeenc: int,
+        freq: str,
 ) -> np.ndarray:
     """
     Extract temporal features from the time stamp.
@@ -188,9 +301,9 @@ def get_time_mark(
 def forecasting_data_provider(data, config, timeenc, batch_size, shuffle, drop_last):
     dataset = DatasetForTransformer(
         dataset=data,
-        history_len=config.seq_len,
-        prediction_len=config.pred_len,
-        label_len=config.label_len,
+        history_len=config.patch_len * config.input_patch_num,
+        prediction_len=config.horizon,
+        label_len=0,
         timeenc=timeenc,
         freq=config.freq,
     )
@@ -207,13 +320,13 @@ def forecasting_data_provider(data, config, timeenc, batch_size, shuffle, drop_l
 
 class DatasetForTransformer:
     def __init__(
-        self,
-        dataset: pd.DataFrame,
-        history_len: int = 10,
-        prediction_len: int = 2,
-        label_len: int = 5,
-        timeenc: int = 1,
-        freq: str = "h",
+            self,
+            dataset: pd.DataFrame,
+            history_len: int = 10,
+            prediction_len: int = 2,
+            label_len: int = 5,
+            timeenc: int = 1,
+            freq: str = "h",
     ):
         # init
 
@@ -282,39 +395,65 @@ class SegLoader(object):
     def __getitem__(self, index):
         index = index * self.step
         if self.mode == "train":
-            return np.float32(self.data[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.mode == 'val'):
-            return np.float32(self.data[index:index + self.win_size]), np.float32(self.test_labels[0:self.win_size])
-        elif (self.mode == 'test'):
-            return np.float32(self.data[index:index + self.win_size]), np.float32(
-                self.test_labels[index:index + self.win_size])
+            return np.float32(self.data[index: index + self.win_size]), np.float32(
+                self.test_labels[0: self.win_size]
+            )
+        elif self.mode == "val":
+            return np.float32(self.data[index: index + self.win_size]), np.float32(
+                self.test_labels[0: self.win_size]
+            )
+        elif self.mode == "test":
+            return np.float32(self.data[index: index + self.win_size]), np.float32(
+                self.test_labels[index: index + self.win_size]
+            )
         else:
-            return np.float32(self.data[
-                              index // self.step * self.win_size:index // self.step * self.win_size + self.win_size]), np.float32(
-                self.test_labels[index // self.step * self.win_size:index // self.step * self.win_size + self.win_size])
+            return np.float32(
+                self.data[
+                index
+                // self.step
+                * self.win_size: index
+                                 // self.step
+                                 * self.win_size
+                                 + self.win_size
+                ]
+            ), np.float32(
+                self.test_labels[
+                index
+                // self.step
+                * self.win_size: index
+                                 // self.step
+                                 * self.win_size
+                                 + self.win_size
+                ]
+            )
 
 
-def anomaly_detection_data_provider(data, batch_size, win_size=100, step=100, mode='train'):
+def anomaly_detection_data_provider(
+        data, batch_size, win_size=100, step=100, mode="train"
+):
     dataset = SegLoader(data, win_size, 1, mode)
 
     shuffle = False
     if mode == "train" or mode == "val":
         shuffle = True
 
-    data_loader = DataLoader(dataset=dataset,
-                             batch_size=batch_size,
-                             shuffle=shuffle,
-                             num_workers=0,
-                             drop_last=False)
+    data_loader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        drop_last=False,
+    )
     return data_loader
+
 
 # x_dec为未来协变量,ouput为经过series_dim处理后的目标值
 class MLP(nn.Module):
     def __init__(self, configs):
         super(MLP, self).__init__()
-        self.linear1 = nn.Linear(configs.input_dim, configs.mlp_hidden_dims)
+        self.linear1 = nn.Linear(configs.input_dim, configs.mlp_hidden_dim)
         self.relu = nn.ReLU()
-        self.linear2 = nn.Linear(configs.mlp_hidden_dims, configs.output_dim)
+        self.linear2 = nn.Linear(configs.mlp_hidden_dim, configs.output_dim)
 
     def forward(self, x_dec, output):
         x_dec = x_dec.float()
@@ -323,7 +462,9 @@ class MLP(nn.Module):
         mlp_input = self.linear1(mlp_input)
         mlp_input = self.relu(mlp_input)
         mlp_input = self.linear2(mlp_input)
+        mlp_input = output + mlp_input
         return mlp_input
+
 
 class Conv(nn.Module):
     def __init__(self, configs):
@@ -345,6 +486,7 @@ class Conv(nn.Module):
         output = self.alpha * output1.permute(0, 2, 1) + (1 - self.alpha) * conv_output
         output = output.permute(0, 2, 1)
         return output
+
 
 class CrossAttention(nn.Module):
     def __init__(self, configs):

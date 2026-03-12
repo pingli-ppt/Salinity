@@ -9,11 +9,7 @@ from typing import Type, Dict, Optional, Tuple
 from torch import optim
 import numpy as np
 import pandas as pd
-from ts_benchmark.baselines.utils import (
-    forecasting_data_provider,
-    train_val_split,
-    get_time_mark,
-)
+from ts_benchmark.baselines.utils_data import train_val_split, forecasting_data_provider,get_time_mark
 from ts_benchmark.baselines.duet.models.duet_model import DUETModel
 from ...models.model_base import ModelBase, BatchMaker
 
@@ -232,7 +228,7 @@ class DUET(ModelBase):
         :param train_ratio_in_tv: Represents the splitting ratio of the training set validation set. If it is equal to 1, it means that the validation set is not partitioned.
         :return: The fitted model object.
         """
-
+        from ts_benchmark.baselines.utils import forecasting_data_provider
         if train_valid_data.shape[1] == 1:
             train_drop_last = False
             self.single_forecasting_hyper_param_tune(train_valid_data)
@@ -352,6 +348,7 @@ class DUET(ModelBase):
         :param testdata: Time data data used for prediction.
         :return: An array of predicted results.
         """
+        from ts_benchmark.baselines.utils import forecasting_data_provider
         if self.early_stopping.check_point is not None:
             self.model.load_state_dict(self.early_stopping.check_point)
 

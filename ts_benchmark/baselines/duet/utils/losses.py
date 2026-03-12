@@ -1,89 +1,166 @@
-# This source code is provided for the purposes of scientific reproducibility
-# under the following limited license from Element AI Inc. The code is an
-# implementation of the N-BEATS model (Oreshkin et al., N-BEATS: Neural basis
-# expansion analysis for interpretable time data forecasting,
-# https://arxiv.org/abs/1905.10437). The copyright to the source code is
-# licensed under the Creative Commons - Attribution-NonCommercial 4.0
-# International license (CC BY-NC 4.0):
-# https://creativecommons.org/licenses/by-nc/4.0/.  Any commercial use (whether
-# for the benefit of third parties or internally in production) requires an
-# explicit license. The subject-matter of the N-BEATS model and associated
-# materials are the property of Element AI Inc. and may be subject to patent
-# protection. No license to patents is granted hereunder (whether express or
-# implied). Copyright © 2020 Element AI Inc. All rights reserved.
-
-"""
-Loss functions for PyTorch.
-"""
-
-import torch as t
-import torch.nn as nn
+# -*- coding: utf-8 -*-
 import numpy as np
-import pdb
 
+__all__ = ["mae", "mse", "rmse", "mape", "smape", "mase", 'wape', 'msmape',
+           "mae_norm", "mse_norm", "rmse_norm", "mape_norm", "smape_norm",
+           "mase_norm", 'wape_norm', 'msmape_norm']
 
-def divide_no_nan(a, b):
-    """
-    a/b where the resulted NaN or Inf are replaced by 0.
-    """
-    result = a / b
-    result[result != result] = .0
-    result[result == np.inf] = .0
-    return result
+# ====================== 工具函数 ======================
+def _error(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    """ Simple error """
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+    return actual - predicted
 
+def _percentage_error(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    """ Percentage error """
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+    eps = 1e-8
+    return (actual - predicted) / (actual + eps)
 
-class mape_loss(nn.Module):
-    def __init__(self):
-        super(mape_loss, self).__init__()
+# 适配 scaler 形状（修复 reshape 报错）
+def _reshape(x):
+    return x.reshape(-1, 1) if x.ndim == 1 else x
 
-    def forward(self, insample: t.Tensor, freq: int,
-                forecast: t.Tensor, target: t.Tensor, mask: t.Tensor) -> t.float:
-        """
-        MAPE loss as defined in: https://en.wikipedia.org/wiki/Mean_absolute_percentage_error
+# ====================== 基础指标 ======================
+def mse(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    return np.mean(np.square(_error(actual, predicted)))
 
-        :param forecast: Forecast values. Shape: batch, time
-        :param target: Target values. Shape: batch, time
-        :param mask: 0/1 mask. Shape: batch, time
-        :return: Loss value
-        """
-        weights = divide_no_nan(mask, target)
-        return t.mean(t.abs((forecast - target) * weights))
+def rmse(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    return np.sqrt(mse(actual, predicted))
 
+def mae(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    return np.mean(np.abs(_error(actual, predicted)))
 
-class smape_loss(nn.Module):
-    def __init__(self):
-        super(smape_loss, self).__init__()
+def mase(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    hist_data: np.ndarray,
+    seasonality: int = 24,
+    **kwargs
+):
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+    hist_data = hist_data[..., 1]
 
-    def forward(self, insample: t.Tensor, freq: int,
-                forecast: t.Tensor, target: t.Tensor, mask: t.Tensor) -> t.float:
-        """
-        sMAPE loss as defined in https://robjhyndman.com/hyndsight/smape/ (Makridakis 1993)
+    # 修复：去掉 seasonality==2 返回 -1
+    n_hist = len(hist_data)
+    if n_hist <= seasonality:
+        return np.mean(np.abs(actual - predicted))
+    
+    #  naive 基准误差
+    naive_mae = np.mean(np.abs(hist_data[seasonality:] - hist_data[:-seasonality]))
+    if naive_mae < 1e-8:
+        return np.mean(np.abs(actual - predicted))
+    
+    return np.mean(np.abs(actual - predicted)) / naive_mae
 
-        :param forecast: Forecast values. Shape: batch, time
-        :param target: Target values. Shape: batch, time
-        :param mask: 0/1 mask. Shape: batch, time
-        :return: Loss value
-        """
-        return 200 * t.mean(divide_no_nan(t.abs(forecast - target),
-                                          t.abs(forecast.data) + t.abs(target.data)) * mask)
+def mape(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    return np.mean(np.abs(_percentage_error(actual, predicted))) * 100
 
+def smape(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+    eps = 1e-8
+    return np.mean(2 * np.abs(actual - predicted) / (np.abs(actual) + np.abs(predicted) + eps)) * 100
 
-class mase_loss(nn.Module):
-    def __init__(self):
-        super(mase_loss, self).__init__()
+def wape(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+    eps = 1e-8
+    return np.sum(np.abs(actual - predicted)) / (np.sum(np.abs(actual)) + eps) * 100
 
-    def forward(self, insample: t.Tensor, freq: int,
-                forecast: t.Tensor, target: t.Tensor, mask: t.Tensor) -> t.float:
-        """
-        MASE loss as defined in "Scaled Errors" https://robjhyndman.com/papers/mase.pdf
+def msmape(actual: np.ndarray, predicted: np.ndarray, epsilon: float = 0.1, **kwargs):
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+    comparator = np.full_like(actual, 0.5 + epsilon)
+    denom = np.maximum(comparator, np.abs(predicted) + np.abs(actual) + epsilon)
+    return np.mean(2 * np.abs(predicted - actual) / denom) * 100
 
-        :param insample: Insample values. Shape: batch, time_i
-        :param freq: Frequency value
-        :param forecast: Forecast values. Shape: batch, time_o
-        :param target: Target values. Shape: batch, time_o
-        :param mask: 0/1 mask. Shape: batch, time_o
-        :return: Loss value
-        """
-        masep = t.mean(t.abs(insample[:, freq:] - insample[:, :-freq]), dim=1)
-        masked_masep_inv = divide_no_nan(mask, masep[:, None])
-        return t.mean(t.abs(target - forecast) * masked_masep_inv)
+# ====================== 归一化指标 ======================
+def _error_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+
+    actual = _reshape(actual)
+    predicted = _reshape(predicted)
+
+    a = scaler.inverse_transform(actual)
+    p = scaler.inverse_transform(predicted)
+    return a - p
+
+def mse_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    return np.mean(np.square(_error_norm(actual, predicted, scaler)))
+
+def rmse_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    return np.sqrt(mse_norm(actual, predicted, scaler))
+
+def mae_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    return np.mean(np.abs(_error_norm(actual, predicted, scaler)))
+
+def mase_norm(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    scaler: object,
+    hist_data: np.ndarray,
+    seasonality: int = 24,
+    **kwargs
+):
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+    hist_data = hist_data[..., 1]
+
+    actual = _reshape(actual)
+    predicted = _reshape(predicted)
+    hist_data = _reshape(hist_data)
+
+    a = scaler.inverse_transform(actual).ravel()
+    p = scaler.inverse_transform(predicted).ravel()
+    h = scaler.inverse_transform(hist_data).ravel()
+
+    n_hist = len(h)
+    if n_hist <= seasonality:
+        return np.mean(np.abs(a - p))
+    
+    naive_mae = np.mean(np.abs(h[seasonality:] - h[:-seasonality]))
+    if naive_mae < 1e-8:
+        return np.mean(np.abs(a - p))
+    
+    return np.mean(np.abs(a - p)) / naive_mae
+
+def mape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    err = _error_norm(actual, predicted, scaler)
+    actual = actual[..., 1]
+    actual = _reshape(actual)
+    a = scaler.inverse_transform(actual).ravel()
+    eps = 1e-8
+    return np.mean(np.abs(err) / (np.abs(a) + eps)) * 100
+
+def smape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+
+    a = scaler.inverse_transform(_reshape(actual)).ravel()
+    p = scaler.inverse_transform(_reshape(predicted)).ravel()
+    eps = 1e-8
+    return np.mean(2 * np.abs(a - p) / (np.abs(a) + np.abs(p) + eps)) * 100
+
+def wape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+
+    a = scaler.inverse_transform(_reshape(actual)).ravel()
+    p = scaler.inverse_transform(_reshape(predicted)).ravel()
+    eps = 1e-8
+    return np.sum(np.abs(a - p)) / (np.sum(np.abs(a)) + eps) * 100
+
+def msmape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, epsilon: float = 0.1, **kwargs):
+    actual = actual[..., 1]
+    predicted = predicted[..., 1]
+
+    a = scaler.inverse_transform(_reshape(actual)).ravel()
+    p = scaler.inverse_transform(_reshape(predicted)).ravel()
+    comparator = np.full_like(a, 0.5 + epsilon)
+    denom = np.maximum(comparator, np.abs(p) + np.abs(a) + epsilon)
+    return np.mean(2 * np.abs(p - a) / denom) * 100
