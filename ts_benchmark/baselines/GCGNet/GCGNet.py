@@ -678,7 +678,7 @@ class GCGNet(ModelBase):
 
         return preds[0]
     def batch_forecast(
-            self, horizon: int, batch_maker: BatchMaker, exog_futures, i, **kwargs
+            self, horizon: int, batch_maker: BatchMaker, exog_futures=None, i=0, **kwargs
     ) -> np.ndarray:
         """
         Make predictions by batch.
@@ -686,7 +686,7 @@ class GCGNet(ModelBase):
         :param horizon: The length of each prediction.
         :param batch_maker: Make batch data used for prediction.
         :param exog_futures: Future exogenous data used for prediction.
-        :i: The index of the batch.
+        :param i: The index of the batch.
         :return: An array of predicted results.
         """
         if self.check_point is not None:
@@ -708,7 +708,7 @@ class GCGNet(ModelBase):
         input_np = input_data["input"]
         series_dim = input_np.shape[-1]
         batch_size = self.config.batch_size
-        if input_data["covariates"] is None:
+        if input_data.get("covariates") is None:
             covariates = {}
         else:
             covariates = input_data["covariates"]
@@ -725,22 +725,18 @@ class GCGNet(ModelBase):
                 )
         else:
             exog_dim = 0
+
         if self.config.norm:
             if exog_dim > 0:
-                # Scale series data with scaler1
                 series_data = input_np[..., :series_dim]
                 origin_shape1 = series_data.shape
                 flattened_data = series_data.reshape((-1, series_data.shape[-1]))
-                series_data = self.scaler1.transform(flattened_data).reshape(
-                    origin_shape1
-                )
-                # Scale exog data with scaler2
+                series_data = self.scaler1.transform(flattened_data).reshape(origin_shape1)
+
                 exog_data = input_np[..., series_dim:]
                 origin_shape2 = exog_data.shape
                 flattened_data = exog_data.reshape((-1, exog_data.shape[-1]))
-                exog_data = self.scaler2.transform(flattened_data).reshape(
-                    origin_shape2
-                )
+                exog_data = self.scaler2.transform(flattened_data).reshape(origin_shape2)
 
                 input_np = np.concatenate((series_data, exog_data), axis=2)
             else:
@@ -748,25 +744,24 @@ class GCGNet(ModelBase):
                 flattened_data = input_np.reshape((-1, input_np.shape[-1]))
                 input_np = self.scaler1.transform(flattened_data).reshape(origin_shape)
 
-        # 传入exog_futures,每个batch中对应的未来协变量
+        # ----------------- 处理 exog_futures -----------------
         if exog_futures is not None:
             exog_future = torch.tensor(
                 exog_futures[i * batch_size: (i + 1) * batch_size, -horizon:, :]
             ).to(device)
         else:
-            exog_future = None
+            # 如果没有外生变量，用全零 tensor 填充
+            exog_future = torch.zeros(batch_size, horizon, exog_dim).to(device)
 
-        if self.config.norm and exog_dim > 0:
+        if self.config.norm and exog_dim > 0 and exog_future is not None:
             flattened_data = exog_future.reshape((-1, exog_future.shape[-1]))
             flattened_data_np = flattened_data.cpu().numpy()
-            exog_future = self.scaler2.transform(flattened_data_np).reshape(
-                exog_future.shape
-            )
+            exog_future = self.scaler2.transform(flattened_data_np).reshape(exog_future.shape)
             exog_future = torch.tensor(exog_future).to(device)
+        # -------------------------------------------------------
+
         input_index = input_data["time_stamps"]
-        padding_len = (
-                              math.ceil(horizon / self.config.horizon) + 1
-                      ) * self.config.horizon
+        padding_len = (math.ceil(horizon / self.config.horizon) + 1) * self.config.horizon
         all_mark = self._padding_time_stamp_mark(input_index, padding_len)
 
         answers = self._perform_rolling_predictions(
@@ -775,9 +770,7 @@ class GCGNet(ModelBase):
 
         if self.config.norm:
             flattened_data = answers.reshape((-1, answers.shape[-1]))
-            answers = self.scaler1.inverse_transform(flattened_data).reshape(
-                answers.shape
-            )
+            answers = self.scaler1.inverse_transform(flattened_data).reshape(answers.shape)
 
         return answers[..., :series_dim]
 
@@ -785,88 +778,80 @@ class GCGNet(ModelBase):
             self,
             horizon: int,
             input_np: np.ndarray,
-            exog_future: torch.Tensor,
+            exog_future: Optional[torch.Tensor],
             series_dim: int,
             all_mark: np.ndarray,
             device: torch.device,
-    ) -> list:
+    ) -> np.ndarray:
         """
         Perform rolling predictions using the given input data and marks.
-
-        :param horizon: Length of predictions to be made.
-        :param input_np: Numpy array of input data.
-        :param exog_future: Future exogenous data used for prediction.
-        :param series_dim: Dimension of the series data.
-        :param all_mark: Numpy array of all marks (time stamps mark).
-        :param device: Device to run the model on.
-        :return: List of predicted results for each prediction batch.
         """
         rolling_time = 0
         input_np, target_np, input_mark_np, target_mark_np = self._get_rolling_data(
             input_np, None, all_mark, rolling_time
         )
-        if exog_future is not None:
-            rolling_time_sum = horizon // self.model_pred_len + 1
-            padding = rolling_time_sum * self.model_pred_len - horizon
-            padding_tensor = torch.zeros(
-                exog_future.shape[0], padding, exog_future.shape[-1]
-            ).to(device)
-            exog_future = torch.cat(
-                (exog_future, padding_tensor),
-                dim=1
-            )
-            exog_future = exog_future.float()
+
+        batch_size = input_np.shape[0]
+        # 如果 exog_future 为 None 或长度不足，创建全零 tensor
+        if exog_future is None or exog_future.shape[0] != batch_size:
+            exog_dim = exog_future.shape[-1] if exog_future is not None else 0
+            exog_future = torch.zeros(batch_size, horizon, exog_dim, device=device)
+
+        # 根据 horizon 补齐 exog_future 长度
+        if exog_future.shape[1] < horizon:
+            pad_len = horizon - exog_future.shape[1]
+            pad_tensor = torch.zeros(batch_size, pad_len, exog_future.shape[-1], device=device)
+            exog_future = torch.cat([exog_future, pad_tensor], dim=1)
+        elif exog_future.shape[1] > horizon:
+            exog_future = exog_future[:, :horizon, :]
+
         with torch.no_grad():
             answers = []
             while not answers or sum(a.shape[1] for a in answers) < horizon:
-                input, dec_input, input_mark, target_mark = (
-                    torch.tensor(input_np, dtype=torch.float32).to(device),
-                    torch.tensor(target_np, dtype=torch.float32).to(device),
-                    torch.tensor(input_mark_np, dtype=torch.float32).to(device),
-                    torch.tensor(target_mark_np, dtype=torch.float32).to(device),
-                )
+                input_tensor = torch.tensor(input_np, dtype=torch.float32).to(device)
+                dec_input_tensor = torch.tensor(target_np, dtype=torch.float32).to(device)
+                input_mark_tensor = torch.tensor(input_mark_np, dtype=torch.float32).to(device)
+                target_mark_tensor = torch.tensor(target_mark_np, dtype=torch.float32).to(device)
 
-                exog_future_sample = exog_future[
-                                     :, rolling_time * self.model_pred_len:, :,
-                                     ] if exog_future is not None else None
+                exog_sample = exog_future[:, rolling_time * self.model_pred_len:, :]
+                # 保证 exog_sample 长度和模型预测长度一致
+                if exog_sample.shape[1] < self.model_pred_len:
+                    pad_len = self.model_pred_len - exog_sample.shape[1]
+                    pad_tensor = torch.zeros(batch_size, pad_len, exog_sample.shape[-1], device=device)
+                    exog_sample = torch.cat([exog_sample, pad_tensor], dim=1)
+                elif exog_sample.shape[1] > self.model_pred_len:
+                    exog_sample = exog_sample[:, :self.model_pred_len, :]
 
-                out_loss = self._process(
-                    input, dec_input, input_mark, target_mark, exog_future_sample
-                )
+                out_loss = self._process(input_tensor, dec_input_tensor, input_mark_tensor, target_mark_tensor, exog_sample)
                 output = out_loss["output"]
-                if self.CovariateFusion is not None and exog_future is not None:
+
+                # CovariateFusion
+                if self.CovariateFusion is not None:
                     output1 = output[:, -self.config.horizon:, :series_dim]
-                    output1 = self.CovariateFusion(exog_future_sample, output1)
+                    output1 = self.CovariateFusion(exog_sample, output1)
                 else:
                     output1 = output[:, -self.config.horizon:, :series_dim]
+
                 column_num = output.shape[-1]
                 real_batch_size = output.shape[0]
-                output = torch.cat(
-                    [output1, output[:, -self.config.horizon:, series_dim:]], dim=-1
-                )
-                answer = (
-                    output.cpu()
-                    .numpy()
-                    .reshape(real_batch_size, -1, column_num)[
-                    :, -self.config.horizon:, :
-                    ]
-                )
+                output = torch.cat([output1, output[:, -self.config.horizon:, series_dim:]], dim=-1)
+
+                answer = output.cpu().numpy().reshape(real_batch_size, -1, column_num)[:, -self.config.horizon:, :]
                 answers.append(answer)
+
                 if sum(a.shape[1] for a in answers) >= horizon:
                     break
+
                 rolling_time += 1
-                output = output.cpu().numpy()[:, -self.config.horizon:, :]
-                new_exog_future_sample = exog_future[
-                                         :,
-                                         rolling_time * self.model_pred_len:rolling_time * self.model_pred_len + self.model_pred_len,
-                                         :,
-                                         ].cpu().numpy() if exog_future is not None else None
-                output = np.concatenate((output, new_exog_future_sample), axis=-1)
+                new_output = output.cpu().numpy()[:, -self.config.horizon:, :]
+                new_exog_sample = exog_future[:, rolling_time * self.model_pred_len:
+                                              rolling_time * self.model_pred_len + self.model_pred_len, :]
+                new_exog_sample = new_exog_sample.cpu().numpy() if new_exog_sample is not None else None
+                if new_exog_sample is not None:
+                    new_output = np.concatenate([new_output, new_exog_sample], axis=-1)
+
                 input_np, target_np, input_mark_np, target_mark_np = self._get_rolling_data(
-                    input_np,
-                    output,
-                    all_mark,
-                    rolling_time
+                    input_np, new_output, all_mark, rolling_time
                 )
 
         answers = np.concatenate(answers, axis=1)
@@ -888,26 +873,29 @@ class GCGNet(ModelBase):
         :param rolling_time: Current rolling time step.
         :return: Updated input data, target data, input marks, and target marks for rolling prediction.
         """
-        if rolling_time > 0:
+        if rolling_time > 0 and output is not None:
             input_np = np.concatenate((input_np, output), axis=1)
             input_np = input_np[:, -self.config.seq_len:, :]
-        target_np = np.zeros(
-            (
-                input_np.shape[0],
-                self.config.label_len + self.config.horizon,
-                input_np.shape[2],
-            )
-        )
-        target_np[:, : self.config.label_len, :] = input_np[
-                                                   :, -self.config.label_len:, :
-                                                   ]
+
+        batch_size, seq_len, dim = input_np.shape
+        target_len = self.config.label_len + self.config.horizon
+
+        target_np = np.zeros((batch_size, target_len, dim))
+        # 历史序列放入 target
+        target_np[:, : self.config.label_len, :] = input_np[:, -self.config.label_len:, :]
+
         advance_len = rolling_time * self.config.horizon
         input_mark_np = all_mark[:, advance_len: self.config.seq_len + advance_len, :]
+
         start = self.config.seq_len - self.config.label_len + advance_len
-        end = self.config.seq_len + self.config.horizon + advance_len
-        target_mark_np = all_mark[
-                         :,
-                         start:end,
-                         :,
-                         ]
+        end = start + self.config.label_len + self.config.horizon
+        # 保证 target_mark_np 长度和 target_np 对齐
+        if end > all_mark.shape[1]:
+            # padding 时间标记
+            pad_len = end - all_mark.shape[1]
+            pad_marks = np.zeros((batch_size, pad_len, all_mark.shape[2]))
+            target_mark_np = np.concatenate((all_mark[:, start:, :], pad_marks), axis=1)
+        else:
+            target_mark_np = all_mark[:, start:end, :]
+
         return input_np, target_np, input_mark_np, target_mark_np

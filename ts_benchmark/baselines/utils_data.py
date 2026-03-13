@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from ts_benchmark.utils.data_processing import split_before
+from ts_benchmark.utils.timefeatures import time_features
 
 def train_val_split(train_data, ratio, seq_len):
     if ratio == 1:
