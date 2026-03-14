@@ -1,7 +1,8 @@
 python3 ./scripts/run_benchmark.py \
 --config-path "rolling_forecast_gcgnet.json" \
 --data-name-list "ocean_salinity_duet.csv" \
---strategy-args '{"horizon": 360, "target_channel": [-1]}' \
+--strategy-args '{"horizon": 360, 
+"target_channel": [-1]}' \
 --model-name "GCGNet" \
 --model-hyper-params '{
 "batch_size": 32, 

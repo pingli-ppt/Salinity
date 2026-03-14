@@ -1,166 +1,216 @@
 # -*- coding: utf-8 -*-
+
 import numpy as np
 
-__all__ = ["mae", "mse", "rmse", "mape", "smape", "mase", 'wape', 'msmape',
-           "mae_norm", "mse_norm", "rmse_norm", "mape_norm", "smape_norm",
-           "mase_norm", 'wape_norm', 'msmape_norm']
+__all__ = ["mae", "mse", "rmse", "mape", "smape", "mase", 'wape', 'msmape', "mae_norm", "mse_norm", "rmse_norm", "mape_norm", "smape_norm", "mase_norm", 'wape_norm', 'msmape_norm']
 
-# ====================== 工具函数 ======================
+
 def _error(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     """ Simple error """
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
     return actual - predicted
+
 
 def _percentage_error(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     """ Percentage error """
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
-    eps = 1e-8
-    return (actual - predicted) / (actual + eps)
+    return (actual - predicted) / actual
 
-# 适配 scaler 形状（修复 reshape 报错）
-def _reshape(x):
-    return x.reshape(-1, 1) if x.ndim == 1 else x
 
-# ====================== 基础指标 ======================
 def mse(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    """ Mean Squared Error """
     return np.mean(np.square(_error(actual, predicted)))
 
+
 def rmse(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    """ Root Mean Squared Error """
     return np.sqrt(mse(actual, predicted))
 
+
 def mae(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    """ Mean Absolute Error """
+
     return np.mean(np.abs(_error(actual, predicted)))
+
 
 def mase(
     actual: np.ndarray,
     predicted: np.ndarray,
     hist_data: np.ndarray,
-    seasonality: int = 24,
+    seasonality: int = 2,
     **kwargs
 ):
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
-    hist_data = hist_data[..., 1]
+    """
+    Mean Absolute Scaled Error
+    Baseline (benchmark) is computed with naive forecasting (shifted by @seasonality)
+    """
+    if seasonality == 2:
+        return -1
+    scale = len(predicted) / (len(hist_data) - seasonality)
 
-    # 修复：去掉 seasonality==2 返回 -1
-    n_hist = len(hist_data)
-    if n_hist <= seasonality:
-        return np.mean(np.abs(actual - predicted))
-    
-    #  naive 基准误差
-    naive_mae = np.mean(np.abs(hist_data[seasonality:] - hist_data[:-seasonality]))
-    if naive_mae < 1e-8:
-        return np.mean(np.abs(actual - predicted))
-    
-    return np.mean(np.abs(actual - predicted)) / naive_mae
+    dif = 0
+    for i in range((seasonality + 1), len(hist_data)):
+        dif = dif + abs(hist_data[i] - hist_data[i - seasonality])
+
+    scale = scale * dif
+
+    return (sum(abs(actual - predicted)) / scale)[0]
+
 
 def mape(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    """
+    Mean Absolute Percentage Error
+    Properties:
+        + Easy to interpret
+        + Scale independent
+        - Biased, not symmetric
+        - Undefined when actual[t] == 0
+    """
     return np.mean(np.abs(_percentage_error(actual, predicted))) * 100
 
+
 def smape(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
-    eps = 1e-8
-    return np.mean(2 * np.abs(actual - predicted) / (np.abs(actual) + np.abs(predicted) + eps)) * 100
+    """
+    Symmetric Mean Absolute Percentage Error
+    """
+    return (
+        np.mean(
+            2.0 * np.abs(actual - predicted) / ((np.abs(actual) + np.abs(predicted)))
+        )
+        * 100
+    )
 
 def wape(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
-    eps = 1e-8
-    return np.sum(np.abs(actual - predicted)) / (np.sum(np.abs(actual)) + eps) * 100
+    """Masked weighted absolute percentage error (WAPE)
+
+    Args:
+        preds (torch.Tensor): predicted values
+        labels (torch.Tensor): labels
+    Returns:
+        torch.Tensor: masked mean absolute error
+    """
+    loss = np.sum(np.abs(actual - predicted)) / np.sum(np.abs(actual)) * 100
+    return loss
 
 def msmape(actual: np.ndarray, predicted: np.ndarray, epsilon: float = 0.1, **kwargs):
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
+    """
+    Function to calculate series wise smape values
+
+    Parameters
+    forecasts - a matrix containing forecasts for a set of series
+                no: of rows should be equal to number of series and no: of columns should be equal to the forecast horizon
+    test_set - a matrix with the same dimensions as 'forecasts' containing the actual values corresponding with them
+    """
+
     comparator = np.full_like(actual, 0.5 + epsilon)
     denom = np.maximum(comparator, np.abs(predicted) + np.abs(actual) + epsilon)
-    return np.mean(2 * np.abs(predicted - actual) / denom) * 100
+    msmape_per_series = np.mean(2 * np.abs(predicted - actual) / denom) * 100
+    return msmape_per_series
 
-# ====================== 归一化指标 ======================
-def _error_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
 
-    actual = _reshape(actual)
-    predicted = _reshape(predicted)
+def _error_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object,  **kwargs):
+    """ Simple error """
+    return scaler.transform(actual) - scaler.transform(predicted)
 
-    a = scaler.inverse_transform(actual)
-    p = scaler.inverse_transform(predicted)
-    return a - p
+
+def _percentage_error_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    """ Percentage error """
+    return (scaler.transform(actual) - scaler.transform(predicted)) / scaler.transform(actual)
+
 
 def mse_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    """ Mean Squared Error """
     return np.mean(np.square(_error_norm(actual, predicted, scaler)))
 
+
 def rmse_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    """ Root Mean Squared Error """
     return np.sqrt(mse_norm(actual, predicted, scaler))
 
+
 def mae_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
+    """ Mean Absolute Error """
+
     return np.mean(np.abs(_error_norm(actual, predicted, scaler)))
+
 
 def mase_norm(
     actual: np.ndarray,
     predicted: np.ndarray,
     scaler: object,
     hist_data: np.ndarray,
-    seasonality: int = 24,
+    seasonality: int = 2,
     **kwargs
 ):
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
-    hist_data = hist_data[..., 1]
+    """
+    Mean Absolute Scaled Error
+    Baseline (benchmark) is computed with naive forecasting (shifted by @seasonality)
+    """
+    actual = scaler.transform(actual)
+    predicted = scaler.transform(predicted)
+    hist_data = scaler.transform(hist_data)
+    if seasonality == 2:
+        return -1
+    scale = len(predicted) / (len(hist_data) - seasonality)
 
-    actual = _reshape(actual)
-    predicted = _reshape(predicted)
-    hist_data = _reshape(hist_data)
+    dif = 0
+    for i in range((seasonality + 1), len(hist_data)):
+        dif = dif + abs(hist_data[i] - hist_data[i - seasonality])
 
-    a = scaler.inverse_transform(actual).ravel()
-    p = scaler.inverse_transform(predicted).ravel()
-    h = scaler.inverse_transform(hist_data).ravel()
+    scale = scale * dif
 
-    n_hist = len(h)
-    if n_hist <= seasonality:
-        return np.mean(np.abs(a - p))
-    
-    naive_mae = np.mean(np.abs(h[seasonality:] - h[:-seasonality]))
-    if naive_mae < 1e-8:
-        return np.mean(np.abs(a - p))
-    
-    return np.mean(np.abs(a - p)) / naive_mae
+    return (sum(abs(actual - predicted)) / scale)[0]
+
 
 def mape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
-    err = _error_norm(actual, predicted, scaler)
-    actual = actual[..., 1]
-    actual = _reshape(actual)
-    a = scaler.inverse_transform(actual).ravel()
-    eps = 1e-8
-    return np.mean(np.abs(err) / (np.abs(a) + eps)) * 100
+    """
+    Mean Absolute Percentage Error
+    Properties:
+        + Easy to interpret
+        + Scale independent
+        - Biased, not symmetric
+        - Undefined when actual[t] == 0
+    """
+    return np.mean(np.abs(_percentage_error_norm(actual, predicted, scaler))) * 100
+
 
 def smape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
-
-    a = scaler.inverse_transform(_reshape(actual)).ravel()
-    p = scaler.inverse_transform(_reshape(predicted)).ravel()
-    eps = 1e-8
-    return np.mean(2 * np.abs(a - p) / (np.abs(a) + np.abs(p) + eps)) * 100
+    """
+    Symmetric Mean Absolute Percentage Error
+    """
+    actual = scaler.transform(actual)
+    predicted = scaler.transform(predicted)
+    return (
+        np.mean(
+            2.0 * np.abs(actual - predicted) / ((np.abs(actual) + np.abs(predicted)))
+        )
+        * 100
+    )
 
 def wape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
+    """Masked weighted absolute percentage error (WAPE)
 
-    a = scaler.inverse_transform(_reshape(actual)).ravel()
-    p = scaler.inverse_transform(_reshape(predicted)).ravel()
-    eps = 1e-8
-    return np.sum(np.abs(a - p)) / (np.sum(np.abs(a)) + eps) * 100
+    Args:
+        preds (torch.Tensor): predicted values
+        labels (torch.Tensor): labels
+    Returns:
+        torch.Tensor: masked mean absolute error
+    """
+    actual = scaler.transform(actual)
+    predicted = scaler.transform(predicted)
+    loss = np.sum(np.abs(actual - predicted)) / np.sum(np.abs(actual)) * 100
+    return loss
 
 def msmape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, epsilon: float = 0.1, **kwargs):
-    actual = actual[..., 1]
-    predicted = predicted[..., 1]
+    """
+    Function to calculate series wise smape values
 
-    a = scaler.inverse_transform(_reshape(actual)).ravel()
-    p = scaler.inverse_transform(_reshape(predicted)).ravel()
-    comparator = np.full_like(a, 0.5 + epsilon)
-    denom = np.maximum(comparator, np.abs(p) + np.abs(a) + epsilon)
-    return np.mean(2 * np.abs(p - a) / denom) * 100
+    Parameters
+    forecasts - a matrix containing forecasts for a set of series
+                no: of rows should be equal to number of series and no: of columns should be equal to the forecast horizon
+    test_set - a matrix with the same dimensions as 'forecasts' containing the actual values corresponding with them
+    """
+    actual = scaler.transform(actual)
+    predicted = scaler.transform(predicted)
+    comparator = np.full_like(actual, 0.5 + epsilon)
+    denom = np.maximum(comparator, np.abs(predicted) + np.abs(actual) + epsilon)
+    msmape_per_series = np.mean(2 * np.abs(predicted - actual) / denom) * 100
+    return msmape_per_series

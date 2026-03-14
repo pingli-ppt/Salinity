@@ -1,6 +1,6 @@
 python3 ./scripts/run_benchmark.py \
 --config-path "1.json" \
---data-name-list "1.csv" \
+--data-name-list "ocean_salinity_duet.csv" \
 --strategy-args '{"horizon": 24}' \
 --model-name "GCGNet" \
 --model-hyper-params '{
@@ -21,4 +21,4 @@ python3 ./scripts/run_benchmark.py \
 "seq_len": 48
 }' \
 --timeout 60000 \
---save-path "test/dbug/GCGNet"
+--save-path "test/debug/GCGNet"
